@@ -97,6 +97,20 @@ local aliases = {}
 local statusState = { defaultMessage = "Ready", tempMessage = nil, tempUntil = 0 }
 local hitboxes = { terminal = {}, monitor = {} }
 
+local TOM_GPU_METHOD_GROUPS = {
+  detection = { "refreshSize", "getSize", "setSize", "getBounds" },
+  render2d = { "fill", "line", "lineS", "rectangle", "filledRectangle", "drawText", "drawTextSmart", "getTextLength", "drawChar", "setFont", "getFont", "addNewChar", "delChar", "clearChars", "freeChars", "getFontDefaultCharID", "setFontDefaultCharID" },
+  imageBuffer = { "newBuffer", "newImage", "decodeImage", "drawImage", "drawBuffer", "imageFromBuffer" },
+  memory = { "getUsedMemory", "getMaxMemory" },
+  windows = { "createWindow", "createWindow3D", "getBounds" },
+  sync = { "sync" },
+}
+
+local TOM_GPU_SIGNATURE_METHODS = {
+  "refreshSize", "getSize", "setSize", "sync", "newBuffer", "newImage", "drawImage", "drawBuffer", "fill", "drawText",
+}
+
+
 local changePage
 local scrollBy
 local refreshData
@@ -108,6 +122,7 @@ local cycleMonitorSelection
 local selectMonitorByName
 local redraw
 local refreshMonitorSettings
+local safeWrap
 
 local function safeCall(fn, ...)
   local ok, result = pcall(fn, ...)
@@ -274,6 +289,220 @@ local function hasMethods(methods, required)
   return true
 end
 
+local function countMatchingMethods(methods, candidates)
+  local count = 0
+  local set = makeMethodSet and makeMethodSet(methods) or nil
+  if not set then
+    set = {}
+    for _, methodName in ipairs(methods or {}) do set[methodName] = true end
+  end
+  for _, methodName in ipairs(candidates or {}) do
+    if set[methodName] then count = count + 1 end
+  end
+  return count
+end
+
+local function isTomGpuPeripheral(name, p)
+  local pType = type(p) == "string" and p or tostring(peripheral.getType(name) or "")
+  return pType == "tm_gpu"
+end
+
+local function hasTomGpuSignature(name, p, methods)
+  if isTomGpuPeripheral(name, p) then return true end
+  local lowerName = string.lower(tostring(name or ""))
+  if lowerName:find("tm_gpu", 1, true) then return true end
+  if countMatchingMethods(methods, TOM_GPU_SIGNATURE_METHODS) >= 4 and hasMethods(methods, { "getSize", "sync" }) then
+    return true
+  end
+  return false
+end
+
+local function safeRefreshTomGpu(p)
+  if not p or type(p.refreshSize) ~= "function" then return false, "refreshSize unavailable" end
+  return safeCall(function()
+    p.refreshSize()
+    return true
+  end)
+end
+
+local function normalizeTomGpuSize(values)
+  local info = {
+    widthPixels = nil,
+    heightPixels = nil,
+    widthBlocks = nil,
+    heightBlocks = nil,
+    resolutionMultiplier = nil,
+    raw = values,
+    ok = false,
+    degradedReason = nil,
+  }
+
+  if type(values) ~= "table" then
+    info.degradedReason = "format getSize invalide"
+    return info
+  end
+
+  if #values >= 2 and type(values[1]) == "number" and type(values[2]) == "number" then
+    info.widthPixels = values[1]
+    info.heightPixels = values[2]
+    if type(values[3]) == "number" and type(values[4]) == "number" then
+      info.widthBlocks = values[3]
+      info.heightBlocks = values[4]
+      if type(values[5]) == "number" then info.resolutionMultiplier = values[5] end
+    elseif type(values[3]) == "number" then
+      info.resolutionMultiplier = values[3]
+    end
+    info.ok = true
+    return info
+  end
+
+  if type(values[1]) == "table" then
+    local size = values[1]
+    info.widthPixels = tonumber(size.widthPixels or size.pixelWidth or size.width or size.x)
+    info.heightPixels = tonumber(size.heightPixels or size.pixelHeight or size.height or size.y)
+    info.widthBlocks = tonumber(size.widthBlocks or size.blocksWidth or size.blockWidth)
+    info.heightBlocks = tonumber(size.heightBlocks or size.blocksHeight or size.blockHeight)
+    info.resolutionMultiplier = tonumber(size.resolutionMultiplier or size.resolution or size.scale)
+    info.ok = info.widthPixels ~= nil and info.heightPixels ~= nil
+    if not info.ok then info.degradedReason = "structure getSize inattendue" end
+    return info
+  end
+
+  info.degradedReason = "valeurs getSize inattendues"
+  return info
+end
+
+local function safeReadTomGpuSize(p)
+  if not p or type(p.getSize) ~= "function" then
+    return { ok = false, degradedReason = "getSize unavailable" }
+  end
+  local ok, values = safeCall(function() return { p.getSize() } end)
+  if not ok then return { ok = false, degradedReason = tostring(values) } end
+  local info = normalizeTomGpuSize(values)
+  if not info.ok and not info.degradedReason then info.degradedReason = "lecture getSize partielle" end
+  return info
+end
+
+local function readTomGpuCapabilities(name, p, methods)
+  local groups = {}
+  local methodSet = {}
+  for _, methodName in ipairs(methods or {}) do methodSet[methodName] = true end
+  for groupName, groupMethods in pairs(TOM_GPU_METHOD_GROUPS) do
+    local available = {}
+    for _, methodName in ipairs(groupMethods) do
+      if methodSet[methodName] then table.insert(available, methodName) end
+    end
+    if #available > 0 then groups[groupName] = available end
+  end
+  if isTomGpuPeripheral(name, p) or hasTomGpuSignature(name, p, methods) then
+    groups.events = { "tm_monitor_touch" }
+  end
+  return groups
+end
+
+local function getTomGpuInfo(name, p)
+  local methods = getPeripheralMethods(name)
+  local wrapped = type(p) == "table" and p or safeWrap(name)
+  local info = {
+    name = name,
+    type = tostring(peripheral.getType(name) or "unknown"),
+    displayType = "tm_gpu",
+    methods = methods,
+    capabilityGroups = readTomGpuCapabilities(name, wrapped, methods),
+    widthPixels = nil,
+    heightPixels = nil,
+    widthBlocks = nil,
+    heightBlocks = nil,
+    resolutionMultiplier = nil,
+    memoryUsed = nil,
+    memoryMax = nil,
+    supportTouch = true,
+    status = "ok",
+    degradedReason = nil,
+    renderMode = "gpu-pending",
+    touchEvent = "tm_monitor_touch",
+  }
+
+  if wrapped then
+    local refreshed, refreshErr = safeRefreshTomGpu(wrapped)
+    if not refreshed and refreshErr ~= "refreshSize unavailable" then
+      info.status = "degraded"
+      info.degradedReason = "refreshSize failed: " .. tostring(refreshErr)
+    end
+
+    local size = safeReadTomGpuSize(wrapped)
+    info.widthPixels = size.widthPixels
+    info.heightPixels = size.heightPixels
+    info.widthBlocks = size.widthBlocks
+    info.heightBlocks = size.heightBlocks
+    info.resolutionMultiplier = size.resolutionMultiplier
+    if not size.ok then
+      info.status = "degraded"
+      info.degradedReason = info.degradedReason or size.degradedReason or "getSize failed"
+    end
+
+    if type(wrapped.getUsedMemory) == "function" then
+      local okUsed, memoryUsed = safeCall(function() return wrapped.getUsedMemory() end)
+      if okUsed and type(memoryUsed) == "number" then info.memoryUsed = memoryUsed end
+    end
+    if type(wrapped.getMaxMemory) == "function" then
+      local okMax, memoryMax = safeCall(function() return wrapped.getMaxMemory() end)
+      if okMax and type(memoryMax) == "number" then info.memoryMax = memoryMax end
+    end
+  else
+    info.status = "degraded"
+    info.degradedReason = "wrap impossible"
+  end
+
+  return info
+end
+
+local function isDisplayPeripheral(name, p)
+  local pType = type(p) == "string" and p or tostring(peripheral.getType(name) or "")
+  local methods = type(p) == "table" and p or getPeripheralMethods(name)
+  return pType == "monitor" or hasMethods(methods, { "getSize", "write", "setTextScale" }) or hasTomGpuSignature(name, pType, methods)
+end
+
+local function normalizeDisplayDevice(info)
+  if not info then return nil end
+  local normalized = {
+    name = info.name,
+    type = info.type,
+    methods = info.methods or {},
+    displayType = info.displayType or "monitor",
+    supportTouch = info.supportTouch == true,
+    status = info.status or "ok",
+    degradedReason = info.degradedReason,
+    capabilityGroups = info.capabilityGroups or {},
+    renderMode = info.renderMode or "terminal",
+    ok = info.ok,
+  }
+  if normalized.displayType == "tm_gpu" then
+    normalized.width = info.widthPixels or "?"
+    normalized.height = info.heightPixels or "?"
+    normalized.widthPixels = info.widthPixels
+    normalized.heightPixels = info.heightPixels
+    normalized.widthBlocks = info.widthBlocks
+    normalized.heightBlocks = info.heightBlocks
+    normalized.resolutionMultiplier = info.resolutionMultiplier
+    normalized.memoryUsed = info.memoryUsed
+    normalized.memoryMax = info.memoryMax
+  else
+    normalized.width = info.width or "?"
+    normalized.height = info.height or "?"
+  end
+  return normalized
+end
+
+local function describeTomGpuForReport(info)
+  if not info then return "tm_gpu unavailable" end
+  local groups = sortedKeys(info.capabilityGroups or {})
+  return string.format(
+    "tm_gpu pixels=%sx%s blocks=%sx%s resolution=%s memory=%s/%s touch=%s status=%s groups=%s",
+    short(info.widthPixels), short(info.heightPixels), short(info.widthBlocks), short(info.heightBlocks), short(info.resolutionMultiplier), short(info.memoryUsed), short(info.memoryMax), tostring(info.supportTouch), short(info.status), #groups > 0 and table.concat(groups, ",") or "none"
+  )
+end
+
 local function getPeripheralNamesByMatcher(matcher)
   local found = {}
   for _, name in ipairs(peripheral.getNames()) do
@@ -292,28 +521,36 @@ local function getFusionControllers() return getPeripheralNamesByMatcher(functio
 local function getInductionPorts() return getPeripheralNamesByMatcher(function(name, pType) local s = string.lower(name .. " " .. pType) return s:find("induction", 1, true) ~= nil end) end
 local function getLaserAmplifiers() return getPeripheralNamesByMatcher(function(name, pType) local s = string.lower(name .. " " .. pType) return s:find("laser", 1, true) ~= nil end) end
 
-local function getMonitorCandidates()
+local function getDisplayCandidates()
   local found = {}
   for _, name in ipairs(peripheral.getNames()) do
     local pType = tostring(peripheral.getType(name) or "")
     local methods = getPeripheralMethods(name)
-    local set = {}; for _, m in ipairs(methods) do set[m] = true end
-    if pType == "monitor" or string.find(string.lower(name), "monitor", 1, true) or (set.getSize and set.write and set.setTextScale) then
-      local info = { name = name, type = pType, methods = methods, width = "?", height = "?", ok = false }
-      local mon = peripheral.wrap(name)
-      if mon and set.getSize then
-        local ok, size = safeCall(function() return { mon.getSize() } end)
-        if ok then info.width = size[1] or "?"; info.height = size[2] or "?"; info.ok = true end
+    local wrapped = safeWrap(name)
+    local methodSet = {}
+    for _, methodName in ipairs(methods) do methodSet[methodName] = true end
+
+    if isTomGpuPeripheral(name, pType) or hasTomGpuSignature(name, pType, methods) then
+      table.insert(found, normalizeDisplayDevice(getTomGpuInfo(name, wrapped)))
+    elseif pType == "monitor" or string.find(string.lower(name), "monitor", 1, true) or (methodSet.getSize and methodSet.write and methodSet.setTextScale) then
+      local info = { name = name, type = pType, displayType = "monitor", methods = methods, width = "?", height = "?", ok = false, supportTouch = true, renderMode = "monitor", status = "ok" }
+      if wrapped and methodSet.getSize then
+        local ok, size = safeCall(function() return { wrapped.getSize() } end)
+        if ok then info.width = size[1] or "?"; info.height = size[2] or "?"; info.ok = true else info.status = "degraded"; info.degradedReason = tostring(size) end
+      else
+        info.status = "degraded"
+        info.degradedReason = wrapped and "getSize unavailable" or "wrap impossible"
       end
-      table.insert(found, info)
+      table.insert(found, normalizeDisplayDevice(info))
     end
   end
   table.sort(found, function(a, b) return a.name < b.name end)
   return found
 end
 
-local function getMonitors() local out = {}; for _, i in ipairs(getMonitorCandidates()) do table.insert(out, i.name) end; return out end
-local function getMonitorInfo(name) for _, i in ipairs(getMonitorCandidates()) do if i.name == name then return i end end; return { name = name, type = "?", width = "?", height = "?", ok = false } end
+local function getMonitorCandidates() return getDisplayCandidates() end
+local function getMonitors() local out = {}; for _, i in ipairs(getDisplayCandidates()) do table.insert(out, i.name) end; return out end
+local function getMonitorInfo(name) for _, i in ipairs(getDisplayCandidates()) do if i.name == name then return i end end; return { name = name, type = "?", displayType = "unknown", width = "?", height = "?", ok = false, status = "missing" } end
 
 selectMonitorByName = function(name, silent)
   local monitors = getMonitors()
@@ -324,7 +561,11 @@ selectMonitorByName = function(name, silent)
       selectedMonitorIndex = i
       if not silent then
         local info = getMonitorInfo(monitorName)
-        setStatus("Moniteur actif: " .. monitorName .. " (" .. tostring(info.width) .. "x" .. tostring(info.height) .. ")", 2.5)
+        if info.displayType == "tm_gpu" then
+          setStatus("Display actif: " .. monitorName .. " [TM GPU] (" .. tostring(info.widthPixels or "?") .. "x" .. tostring(info.heightPixels or "?") .. " px)", 2.5)
+        else
+          setStatus("Display actif: " .. monitorName .. " [CC Monitor] (" .. tostring(info.width) .. "x" .. tostring(info.height) .. ")", 2.5)
+        end
       end
       return true
     end
@@ -381,8 +622,17 @@ cycleMonitorSelection = function()
 end
 
 local function selectNextMonitor() return cycleMonitorSelection() end
-disableMonitorOutput = function() selectedMonitorIndex = 0; selectedMonitorName = nil; setStatus("Affichage moniteur desactive", 2) end
-local function getSelectedMonitor() refreshSelectedMonitor(); return selectedMonitorName and peripheral.wrap(selectedMonitorName) or nil end
+disableMonitorOutput = function() selectedMonitorIndex = 0; selectedMonitorName = nil; setStatus("Affichage display desactive", 2) end
+local function getSelectedDisplayInfo()
+  refreshSelectedMonitor()
+  return selectedMonitorName and getMonitorInfo(selectedMonitorName) or nil
+end
+
+local function getSelectedMonitor()
+  local info = getSelectedDisplayInfo()
+  if not info or info.displayType ~= "monitor" then return nil end
+  return peripheral.wrap(info.name)
+end
 
 local function getReaderSummary(name)
   local reader = peripheral.wrap(name)
@@ -436,7 +686,7 @@ local function getModemInfo(modem)
   return { nameLocal = okL and localName or "N/A", namesRemote = okR and remotes or {} }
 end
 
-local function safeWrap(name)
+safeWrap = function(name)
   local ok, wrapped = safeCall(function() return peripheral.wrap(name) end)
   if ok and wrapped then return wrapped end
   return nil
@@ -746,6 +996,7 @@ local function getSuggestedRole(name, pType, methods, readerRole)
   if readerRole then return readerRole end
   if pType == "block_reader" then return "block_reader" end
   if pType == "redstone_relay" then return "relay" end
+  if pType == "tm_gpu" then return "tm_gpu" end
   if pType == "monitor" then return "monitor" end
   if pType == "modem" then return "modem" end
   if low:find("logic", 1, true) and low:find("fusion", 1, true) then return "logic_adapter" end
@@ -756,6 +1007,7 @@ local function getSuggestedRole(name, pType, methods, readerRole)
   if hasMethods(methods, { "setAnalogOutput", "getAnalogInput" }) then return "relay" end
   if hasMethods(methods, { "getBlockData" }) then return "block_reader" end
   if hasMethods(methods, { "getNamesRemote", "getNameLocal" }) then return "modem" end
+  if hasTomGpuSignature(name, pType, methods) then return "tm_gpu" end
   if hasMethods(methods, { "getSize", "setTextScale" }) then return "monitor" end
   return "other"
 end
@@ -811,6 +1063,24 @@ local function getDeviceSummaryByType(name, pType, wrapped, methods, readerSumma
     else
       raw.error = "wrap impossible"
     end
+    return summary, raw
+  end
+
+  if isTomGpuPeripheral(name, pType) or hasTomGpuSignature(name, pType, methods) then
+    local gpuInfo = getTomGpuInfo(name, wrapped)
+    summary.displayType = gpuInfo.displayType
+    summary.supportTouch = gpuInfo.supportTouch
+    summary.status = gpuInfo.status
+    summary.degradedReason = gpuInfo.degradedReason
+    summary.widthPixels = gpuInfo.widthPixels
+    summary.heightPixels = gpuInfo.heightPixels
+    summary.widthBlocks = gpuInfo.widthBlocks
+    summary.heightBlocks = gpuInfo.heightBlocks
+    summary.resolutionMultiplier = gpuInfo.resolutionMultiplier
+    summary.memoryUsed = gpuInfo.memoryUsed
+    summary.memoryMax = gpuInfo.memoryMax
+    summary.capabilityGroups = gpuInfo.capabilityGroups
+    raw.tomGpu = gpuInfo
     return summary, raw
   end
 
@@ -903,8 +1173,14 @@ local function gatherAllData()
   data.peripherals = peripheral.getNames(); table.sort(data.peripherals)
   data.blockReaders = getBlockReaders()
   data.redstoneRelays = getRedstoneRelays()
+  data.displays = getDisplayCandidates()
   data.monitors = getMonitors()
-  data.monitorCandidates = getMonitorCandidates()
+  data.monitorCandidates = data.displays
+  data.tomGpus = {}
+  data.ccMonitors = {}
+  for _, display in ipairs(data.displays) do
+    if display.displayType == "tm_gpu" then table.insert(data.tomGpus, display) else table.insert(data.ccMonitors, display) end
+  end
   data.modems = getModems()
   data.fusionControllers = getFusionControllers()
   data.inductionPorts = getInductionPorts()
@@ -1049,9 +1325,12 @@ local function pageLabel(page) return PAGE_TITLES[page] or page end
 local function monitorStateText(data)
   if selectedMonitorName then
     local i = getMonitorInfo(selectedMonitorName)
-    return string.format("Monitor: %s (%sx%s)", getDisplayName(selectedMonitorName), tostring(i.width), tostring(i.height))
+    if i.displayType == "tm_gpu" then
+      return string.format("Display: TM GPU %s (%sx%s px)", getDisplayName(selectedMonitorName), tostring(i.widthPixels or i.width), tostring(i.heightPixels or i.height))
+    end
+    return string.format("Display: Monitor %s (%sx%s)", getDisplayName(selectedMonitorName), tostring(i.width), tostring(i.height))
   end
-  return #data.monitors > 0 and string.format("Monitor: OFF (%d detected)", #data.monitors) or "Monitor: none"
+  return #data.monitors > 0 and string.format("Display: OFF (%d detected)", #data.monitors) or "Display: none"
 end
 
 local function drawHeader(dev)
@@ -1151,7 +1430,8 @@ local function drawSummaryDashboard(dev, data)
       makeLine("Block readers: " .. #data.blockReaders),
       makeLine("Relays: " .. #data.redstoneRelays),
       makeLine("Modems: " .. #data.modems),
-      makeLine("Monitors: " .. #data.monitors)
+      makeLine("Displays: " .. #data.monitors),
+      makeLine("TM GPU: " .. #(data.tomGpus or {}), colorsUI.info)
     } },
     { title = "Readers by role", lines = {} },
     { title = "Relay activity", lines = {} },
@@ -1247,7 +1527,7 @@ local function buildPageLines(data)
         if #methods == 0 then table.insert(lines, makeLine("    (no methods)", colorsUI.bad)) else for _, m in ipairs(methods) do table.insert(lines, makeLine("    - " .. m)) end end
       end
     end
-    if category == "all" or category == "monitors" then addMethods("monitors", data.monitors) end
+    if category == "all" or category == "monitors" then addMethods("displays (CC monitor + TM GPU)", data.monitors) end
     if category == "all" or category == "block_readers" then addMethods("block_readers", data.blockReaders) end
     if category == "all" or category == "redstone_relays" then addMethods("redstone_relays", data.redstoneRelays) end
     if category == "all" or category == "modems" then addMethods("modems", data.modems) end
@@ -1255,21 +1535,31 @@ local function buildPageLines(data)
     if category == "all" or category == "induction" then addMethods("induction ports", data.inductionPorts) end
     if category == "all" or category == "lasers" then addMethods("laser amplifiers", data.laserAmplifiers) end
   elseif currentPage == "monitors" then
-    table.insert(lines, makeLine("MONITOR MANAGEMENT", colorsUI.title))
-    table.insert(lines, makeLine("Detected monitors: " .. #data.monitorCandidates, colorsUI.info))
-    table.insert(lines, makeLine(selectedMonitorName and ("Active monitor: " .. getDisplayName(selectedMonitorName) .. " <" .. selectedMonitorName .. ">") or "Active monitor: OFF", selectedMonitorName and colorsUI.good or colorsUI.warn))
-    table.insert(lines, makeLine("M: next monitor | N: disable output", colorsUI.section))
+    table.insert(lines, makeLine("DISPLAY MANAGEMENT", colorsUI.title))
+    table.insert(lines, makeLine("Detected displays: " .. #data.monitorCandidates .. " (CC=" .. #(data.ccMonitors or {}) .. ", TM GPU=" .. #(data.tomGpus or {}) .. ")", colorsUI.info))
+    table.insert(lines, makeLine(selectedMonitorName and ("Active display: " .. getDisplayName(selectedMonitorName) .. " <" .. selectedMonitorName .. ">") or "Active display: OFF", selectedMonitorName and colorsUI.good or colorsUI.warn))
+    table.insert(lines, makeLine("M: next display | N: disable output", colorsUI.section))
     for i, info in ipairs(data.monitorCandidates) do
       local mark = info.name == selectedMonitorName and "*" or " "
-      table.insert(lines, makeLine(string.format("%s [%d] %s <%s> %sx%s", mark, i, getDisplayName(info.name), info.name, short(info.width), short(info.height)), info.name == selectedMonitorName and colorsUI.good or colorsUI.text))
+      local label = info.displayType == "tm_gpu" and "TM GPU" or "CC Monitor"
+      local extra = info.displayType == "tm_gpu" and string.format(" px=%sx%s blocks=%sx%s res=%s mem=%s/%s touch=%s", short(info.widthPixels), short(info.heightPixels), short(info.widthBlocks), short(info.heightBlocks), short(info.resolutionMultiplier), short(info.memoryUsed), short(info.memoryMax), tostring(info.supportTouch)) or string.format(" chars=%sx%s", short(info.width), short(info.height))
+      table.insert(lines, makeLine(string.format("%s [%d] %s <%s> [%s]%s status=%s", mark, i, getDisplayName(info.name), info.name, label, extra, short(info.status)), info.name == selectedMonitorName and colorsUI.good or colorsUI.text))
+      if info.displayType == "tm_gpu" then
+        table.insert(lines, makeLine("    caps=" .. table.concat(sortedKeys(info.capabilityGroups or {}), ", ") .. (info.degradedReason and (" degraded=" .. info.degradedReason) or ""), colorsUI.dim))
+      end
     end
   elseif currentPage == "peripherals" then
     table.insert(lines, makeLine("PERIPHERAL INVENTORY", colorsUI.title))
     for _, n in ipairs(data.peripherals) do
       local alias = getAlias(n)
       local sug = getSuggestedAlias(n)
+      local detail = data.allDevicesDetailed and data.allDevicesDetailed[n]
       local extra = alias and (" alias=" .. alias) or (sug and (" suggested=" .. sug) or "")
-      table.insert(lines, makeLine(string.format("- %s <%s> type=%s%s", getDisplayName(n), n, tostring(peripheral.getType(n)), extra), colorsUI.text))
+      local baseLine = string.format("- %s <%s> type=%s role=%s%s", getDisplayName(n), n, tostring(peripheral.getType(n)), short(detail and detail.suggestedRole), extra)
+      table.insert(lines, makeLine(baseLine, colorsUI.text))
+      if detail and detail.type == "tm_gpu" then
+        table.insert(lines, makeLine("    " .. describeTomGpuForReport(detail.summary), colorsUI.info))
+      end
     end
   elseif currentPage == "aliases" then
     table.insert(lines, makeLine("Use dedicated alias editor panel", colorsUI.dim))
@@ -1325,7 +1615,8 @@ end
 local function drawMonitorControls(dev, source, x, y, data)
   local curX = x
   for i, mon in ipairs(data.monitors or {}) do
-    local label = "Select M" .. tostring(i - 1)
+    local info = getMonitorInfo(mon)
+    local label = (info.displayType == "tm_gpu" and "GPU " or "Mon ") .. tostring(i - 1)
     curX = curX + drawButton(dev, source, "monitor:select:" .. mon, curX, y, label, {
       active = selectedMonitorName == mon,
       onClick = function() selectMonitorByName(mon); refreshMonitorSettings(); redraw() end,
@@ -1340,18 +1631,31 @@ local function drawMonitorsPage(dev, source, data)
   local w, h = dev.getSize()
   local top = config.ui.showTabBar and 5 or 4
   local bottom = h - 2
-  drawBox(dev, 1, top - 1, w, bottom - top + 2, "MONITOR MANAGEMENT", colorsUI.dim)
+  drawBox(dev, 1, top - 1, w, bottom - top + 2, "DISPLAY MANAGEMENT", colorsUI.dim)
   local active = selectedMonitorName and getMonitorInfo(selectedMonitorName) or nil
-  writeClipped(dev, 3, top, "Detected: " .. tostring(#data.monitorCandidates), colorsUI.info)
-  writeClipped(dev, 3, top + 1, selectedMonitorName and ("Active: " .. selectedMonitorName .. " (" .. tostring(active.width) .. "x" .. tostring(active.height) .. ")") or "Active: OFF", selectedMonitorName and colorsUI.good or colorsUI.warn)
-  writeClipped(dev, 3, top + 2, "Output mode: " .. (selectedMonitorName and "monitor" or "terminal-only"), colorsUI.section)
+  writeClipped(dev, 3, top, "Detected: " .. tostring(#data.monitorCandidates) .. " | CC=" .. tostring(#(data.ccMonitors or {})) .. " | TM GPU=" .. tostring(#(data.tomGpus or {})), colorsUI.info)
+  local activeLabel = "Active: OFF"
+  if selectedMonitorName and active then
+    if active.displayType == "tm_gpu" then
+      activeLabel = "Active: " .. selectedMonitorName .. " [TM GPU] (" .. tostring(active.widthPixels or "?") .. "x" .. tostring(active.heightPixels or "?") .. " px)"
+    else
+      activeLabel = "Active: " .. selectedMonitorName .. " [CC Monitor] (" .. tostring(active.width) .. "x" .. tostring(active.height) .. ")"
+    end
+  end
+  writeClipped(dev, 3, top + 1, activeLabel, selectedMonitorName and colorsUI.good or colorsUI.warn)
+  writeClipped(dev, 3, top + 2, "Output mode: " .. (selectedMonitorName and ((active and active.displayType == "tm_gpu") and "gpu-pending / terminal fallback" or "monitor") or "terminal-only"), colorsUI.section)
   drawMonitorControls(dev, source, 3, top + 3, data)
 
   local rowY = top + 5
   for i, info in ipairs(data.monitorCandidates) do
     if rowY > bottom - 1 then break end
     local selected = info.name == selectedMonitorName
-    local line = string.format("[%d] %s <%s> size=%sx%s type=%s status=%s selected=%s", i, getDisplayName(info.name), info.name, short(info.width), short(info.height), tostring(info.type), info.ok and "OK" or "ERR", selected and "yes" or "no")
+    local line
+    if info.displayType == "tm_gpu" then
+      line = string.format("[%d] %s <%s> [TM GPU] px=%sx%s blocks=%sx%s res=%s mem=%s/%s touch=%s status=%s", i, getDisplayName(info.name), info.name, short(info.widthPixels), short(info.heightPixels), short(info.widthBlocks), short(info.heightBlocks), short(info.resolutionMultiplier), short(info.memoryUsed), short(info.memoryMax), tostring(info.supportTouch), short(info.status))
+    else
+      line = string.format("[%d] %s <%s> [CC Monitor] size=%sx%s type=%s status=%s selected=%s", i, getDisplayName(info.name), info.name, short(info.width), short(info.height), tostring(info.type), info.ok and "OK" or "ERR", selected and "yes" or "no")
+    end
     writeClipped(dev, 3, rowY, ellipsis(line, w - 6), selected and colorsUI.good or colorsUI.text)
     addHitbox(source, "monitor:line:" .. info.name, 3, rowY, w - 3, rowY, function() selectMonitorByName(info.name); refreshMonitorSettings(); redraw() end)
     local btnLabel = selected and "Using" or "Use"
@@ -1361,6 +1665,10 @@ local function drawMonitorsPage(dev, source, data)
       onClick = function() selectMonitorByName(info.name); refreshMonitorSettings(); redraw() end,
     })
     rowY = rowY + 1
+    if info.displayType == "tm_gpu" and rowY <= bottom - 1 then
+      writeClipped(dev, 5, rowY, "caps: " .. table.concat(sortedKeys(info.capabilityGroups or {}), ", ") .. (info.degradedReason and (" | degraded=" .. info.degradedReason) or ""), colorsUI.dim)
+      rowY = rowY + 1
+    end
   end
 end
 
@@ -1422,6 +1730,9 @@ local function buildFormattedReport(data)
   table.insert(out, "induction_ports = " .. #data.inductionPorts)
   table.insert(out, "laser_amplifiers = " .. #data.laserAmplifiers)
   table.insert(out, "remote_peripherals = " .. (data.totalRemotePeripherals or 0))
+  table.insert(out, "displays = " .. #(data.displays or {}))
+  table.insert(out, "cc_monitors = " .. #(data.ccMonitors or {}))
+  table.insert(out, "tm_gpus = " .. #(data.tomGpus or {}))
   table.insert(out, "reader_roles = " .. encodeRaw(data.readerClassification.counts, 0, {}, 0))
   table.insert(out, "")
 
@@ -1478,6 +1789,9 @@ local function buildFormattedReport(data)
         table.insert(out, "Wrapped: " .. tostring(d.wrapped))
         table.insert(out, "Methods:")
         if #d.methods == 0 then table.insert(out, "- (none)") else for _, m in ipairs(d.methods) do table.insert(out, "- " .. m) end end
+        if d.type == "tm_gpu" then
+          table.insert(out, "Tom GPU: " .. describeTomGpuForReport(d.summary))
+        end
         table.insert(out, "Summary:")
         local summaryDump = flattenTable(d.summary, 0, nil, nil, { maxDepth = config.maxFlattenDepth, maxLines = 60 })
         if #summaryDump == 0 then table.insert(out, "- (none)") else for _, line in ipairs(summaryDump) do table.insert(out, "- " .. line) end end
@@ -1510,7 +1824,9 @@ local function buildFormattedReport(data)
   end
 
   local grouped = {
-    monitors = data.monitors or {},
+    displays = data.monitors or {},
+    cc_monitors = data.ccMonitors or {},
+    tm_gpus = data.tomGpus or {},
     block_readers = data.blockReaders or {},
     redstone_relays = data.redstoneRelays or {},
     modems = data.modems or {},
@@ -1525,7 +1841,9 @@ local function buildFormattedReport(data)
   for _, n in ipairs(data.peripherals or {}) do if not seen[n] then table.insert(others, n) end end
   table.sort(others)
 
-  addDeviceSection("monitors", grouped.monitors)
+  addDeviceSection("displays", grouped.displays)
+  addDeviceSection("cc_monitors", grouped.cc_monitors)
+  addDeviceSection("tm_gpus", grouped.tm_gpus)
   addDeviceSection("block_readers", grouped.block_readers)
   addDeviceSection("redstone_relays", grouped.redstone_relays)
   addDeviceSection("modems", grouped.modems)
@@ -1544,8 +1862,20 @@ local function buildRawReport(data)
     table.insert(monitorStates, {
       index = i,
       name = info.name,
+      displayType = info.displayType,
       width = info.width,
       height = info.height,
+      widthPixels = info.widthPixels,
+      heightPixels = info.heightPixels,
+      widthBlocks = info.widthBlocks,
+      heightBlocks = info.heightBlocks,
+      resolutionMultiplier = info.resolutionMultiplier,
+      memoryUsed = info.memoryUsed,
+      memoryMax = info.memoryMax,
+      supportTouch = info.supportTouch,
+      capabilityGroups = info.capabilityGroups,
+      status = info.status,
+      degradedReason = info.degradedReason,
       selected = info.name == selectedMonitorName,
       ok = info.ok,
     })
@@ -1566,8 +1896,15 @@ local function buildRawReport(data)
 end
 
 refreshMonitorSettings = function()
+  local info = getSelectedDisplayInfo()
   local mon = getSelectedMonitor()
-  if mon then pcall(function() mon.setTextScale(config.defaultMonitorScale) end); pcall(function() mon.setBackgroundColor(colorsUI.bg) end); pcall(function() mon.setTextColor(colorsUI.text) end) end
+  if mon and info and info.displayType == "monitor" then
+    pcall(function() mon.setTextScale(config.defaultMonitorScale) end)
+    pcall(function() mon.setBackgroundColor(colorsUI.bg) end)
+    pcall(function() mon.setTextColor(colorsUI.text) end)
+  elseif info and info.displayType == "tm_gpu" then
+    setStatus("TM GPU detecte, rendu dedie non encore utilise", 2)
+  end
 end
 
 local function renderPage(dev, data, source)
@@ -1593,9 +1930,9 @@ refreshData = function(skipDefaultStatus)
   refreshSelectedMonitor()
   latestData = gatherAllData()
   if not skipDefaultStatus then
-    if selectedMonitorName then setStatus("Moniteur actif : " .. getDisplayName(selectedMonitorName))
-    elseif #latestData.monitors == 1 then setStatus("1 moniteur detecte")
-    else setStatus("Aucun moniteur selectionne") end
+    if selectedMonitorName then setStatus("Display actif : " .. getDisplayName(selectedMonitorName))
+    elseif #latestData.monitors == 1 then setStatus("1 display detecte")
+    else setStatus("Aucun display selectionne") end
   end
   refreshMonitorSettings(); redraw()
 end
@@ -1662,6 +1999,13 @@ local function handleMonitorTouch(side, x, y)
   handleClick(x, y, "monitor")
 end
 
+local function handleTmMonitorTouch(x, y, sneaking)
+  local info = getSelectedDisplayInfo()
+  if not info or info.displayType ~= "tm_gpu" then return end
+  setStatus("TM GPU touch: x=" .. tostring(x) .. " y=" .. tostring(y) .. " sneaking=" .. tostring(sneaking), 1.5)
+  handleClick(x, y, "monitor")
+end
+
 local function handleTerminalClick(x, y)
   handleClick(x, y, "terminal")
 end
@@ -1672,6 +2016,8 @@ local function handleInputEvents()
     local event = ev[1]
     if event == "monitor_touch" then
       handleMonitorTouch(ev[2], ev[3], ev[4])
+    elseif event == "tm_monitor_touch" then
+      handleTmMonitorTouch(ev[2], ev[3], ev[4])
     elseif event == "mouse_click" then
       handleTerminalClick(ev[3], ev[4])
     elseif event == "char" then
